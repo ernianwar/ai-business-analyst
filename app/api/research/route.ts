@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { getAuthenticatedContext } from "@/lib/auth/get-context";
 import { validateIdeaInput, wrapUntrustedInput } from "@/lib/security/sanitize";
 import { checkAIRateLimit } from "@/lib/security/ai-rate-limiter";
+import { recordAIUsage } from "@/lib/security/ai-usage-tracker";
+import { recordAISecurityEvent, generateCorrelationId } from "@/lib/security/ai-security-events";
 
 const TAVILY_RESEARCH_ENDPOINT = "https://api.tavily.com/research";
 const TAVILY_RESEARCH_GET = "https://api.tavily.com/research";
@@ -360,16 +362,21 @@ function buildEvidence(
 }
 
 export async function POST(request: Request) {
+  const correlationId = generateCorrelationId();
+  const start = Date.now();
+
+  // Resolve identity BEFORE try block so it is accessible in catch for audit trails.
+  // If auth fails, return immediately — no usage or security events for unauthenticated requests.
+  const ctx = await getAuthenticatedContext();
+
+  if (!ctx || !ctx.business_id) {
+    return NextResponse.json(
+      { error: "Business context required. Complete onboarding first.", code: "NO_BUSINESS" },
+      { status: 404 }
+    );
+  }
+
   try {
-    const ctx = await getAuthenticatedContext();
-
-    if (!ctx || !ctx.business_id) {
-      return NextResponse.json(
-        { error: "Business context required. Complete onboarding first.", code: "NO_BUSINESS" },
-        { status: 404 }
-      );
-    }
-
     // Rate limit enforcement (this route calls external Tavily API, not the model gateway)
     const rateLimit = await checkAIRateLimit({
       user_id: ctx.user_id,
@@ -378,6 +385,18 @@ export async function POST(request: Request) {
     });
 
     if (!rateLimit.allowed) {
+      await recordAISecurityEvent({
+        event_type: "AI_RATE_LIMITED",
+        severity: "MEDIUM",
+        user_id: ctx.user_id,
+        workspace_id: ctx.workspace_id,
+        business_id: ctx.business_id,
+        endpoint: "research",
+        correlation_id: correlationId,
+        reason: `Research rate limit exceeded: denied by ${rateLimit.denied_by}`,
+        metadata: { denied_by: rateLimit.denied_by, limit: rateLimit.limit, remaining: rateLimit.remaining },
+      });
+
       return NextResponse.json(
         { error: "Rate limit exceeded. Please try again later.", code: "RATE_LIMITED" },
         { status: 429 }
@@ -434,6 +453,20 @@ export async function POST(request: Request) {
       requestId,
       apiKey
     );
+
+    // Record successful usage
+    await recordAIUsage({
+      correlation_id: correlationId,
+      user_id: ctx.user_id,
+      workspace_id: ctx.workspace_id!,
+      business_id: ctx.business_id,
+      agent_key: "research",
+      endpoint: "research",
+      provider: "tavily",
+      model: "tavily-research",
+      status: "SUCCESS",
+      duration_ms: Date.now() - start,
+    });
 
     const rawContent = research?.content;
 
@@ -582,6 +615,35 @@ export async function POST(request: Request) {
     );
 
     const message = error instanceof Error ? error.message : "Live research could not be completed.";
+
+    // Record failure usage (ctx is guaranteed non-null here)
+    await recordAIUsage({
+      correlation_id: correlationId,
+      user_id: ctx.user_id,
+      workspace_id: ctx.workspace_id!,
+      business_id: ctx.business_id,
+      agent_key: "research",
+      endpoint: "research",
+      provider: "tavily",
+      model: "tavily-research",
+      status: "FAILURE",
+      failure_type: "PROVIDER_ERROR",
+      duration_ms: Date.now() - start,
+    });
+
+    // Record security event for failures
+    await recordAISecurityEvent({
+      event_type: "AI_FAILURE",
+      severity: "MEDIUM",
+      user_id: ctx.user_id,
+      workspace_id: ctx.workspace_id,
+      business_id: ctx.business_id,
+      endpoint: "research",
+      correlation_id: correlationId,
+      reason: `Research failed: ${message.slice(0, 200)}`,
+      metadata: { error: message.slice(0, 200) },
+    });
+
     if (message.includes("Unauthenticated")) {
       return NextResponse.json({ error: "Unauthenticated" }, { status: 401 });
     }
